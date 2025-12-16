@@ -564,6 +564,162 @@ def soldmis_bookings():
         }
     })
 
+@app.get("/soldmis/receivables")
+def soldmis_receivables():
+    frm, to, err = get_date_range()
+    if err:
+        return err
+
+    limit = request.args.get("limit", "200")
+    try:
+        limit_n = max(1, min(int(limit), 1000))
+    except Exception:
+        return jsonify({"error": "limit must be an integer between 1 and 1000"}), 400
+
+    min_receivable = request.args.get("min_receivable", "1")
+    try:
+        min_receivable_n = float(min_receivable)
+    except Exception:
+        return jsonify({"error": "min_receivable must be a number"}), 400
+
+    # Optional filters (only if columns exist)
+    filters = []
+    params = [
+        bigquery.ScalarQueryParameter("from", "DATE", frm),
+        bigquery.ScalarQueryParameter("to", "DATE", to),
+        bigquery.ScalarQueryParameter("min_recv", "NUMERIC", min_receivable_n),
+    ]
+
+    def add_filter(arg_name, col_name):
+        v = request.args.get(arg_name)
+        if v and col_name:
+            filters.append(f"UPPER(CAST({col_name} AS STRING)) = UPPER(@{arg_name})")
+            params.append(bigquery.ScalarQueryParameter(arg_name, "STRING", v))
+
+    add_filter("cluster", "Cluster")
+    add_filter("source", "SOURCE")
+    add_filter("unit_type", "UNIT_TYPE")
+    add_filter("sale_agreement_status", "SALE_AGREEMENT_STATUS")
+    add_filter("loan_status", "LOAN_STATUS")
+
+    where_filters = ""
+    if filters:
+        where_filters = " AND " + " AND ".join(filters)
+
+    sql = f"""
+      SELECT
+        CAST(UNIT_NO AS STRING) AS unit_no,
+        COALESCE(CAST(CUSTOMER_NAME AS STRING), "") AS customer_name,
+        COALESCE(CAST(Cluster AS STRING), "") AS cluster,
+        COALESCE(CAST(UNIT_TYPE AS STRING), "") AS unit_type,
+        COALESCE(CAST(SOURCE AS STRING), "") AS source,
+        COALESCE(CAST(SALE_AGREEMENT_STATUS AS STRING), "") AS sale_agreement_status,
+        SAFE_CAST(RECEIVABLES AS NUMERIC) AS receivables,
+        SAFE_CAST(PENDING_DEMAND AS NUMERIC) AS pending_demand,
+        SAFE_CAST(GROSS_AMOUNT_RECEIVED AS NUMERIC) AS gross_amount_received
+      FROM {table_fqn()}
+      WHERE DATE BETWEEN @from AND @to
+        AND COALESCE(SAFE_CAST(RECEIVABLES AS NUMERIC), 0) >= @min_recv
+        {where_filters}
+      ORDER BY receivables DESC
+      LIMIT {limit_n}
+    """
+
+    rows = []
+    total_in_list = 0.0
+    job = bq.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=params))
+    for r in job.result():
+        d = dict(r)
+        d["receivables"] = float(d.get("receivables") or 0)
+        d["pending_demand"] = float(d.get("pending_demand") or 0)
+        d["gross_amount_received"] = float(d.get("gross_amount_received") or 0)
+        total_in_list += d["receivables"]
+        rows.append(d)
+
+    return jsonify({
+        "from": frm,
+        "to": to,
+        "total_receivables_in_list": total_in_list,
+        "rows": rows
+    })
+
+
+@app.get("/soldmis/bookings")
+def soldmis_bookings():
+    frm, to, err = get_date_range()
+    if err:
+        return err
+
+    limit = request.args.get("limit", "200")
+    try:
+        limit_n = max(1, min(int(limit), 1000))
+    except Exception:
+        return jsonify({"error": "limit must be an integer between 1 and 1000"}), 400
+
+    sold_only = (request.args.get("sold_only", "true").lower() in ("true", "1", "yes"))
+
+    filters = []
+    params = [
+        bigquery.ScalarQueryParameter("from", "DATE", frm),
+        bigquery.ScalarQueryParameter("to", "DATE", to),
+    ]
+
+    def add_filter(arg_name, col_name):
+        v = request.args.get(arg_name)
+        if v and col_name:
+            filters.append(f"UPPER(CAST({col_name} AS STRING)) = UPPER(@{arg_name})")
+            params.append(bigquery.ScalarQueryParameter(arg_name, "STRING", v))
+
+    add_filter("cluster", "Cluster")
+    add_filter("source", "SOURCE")
+    add_filter("unit_type", "UNIT_TYPE")
+    add_filter("sale_agreement_status", "SALE_AGREEMENT_STATUS")
+    add_filter("loan_status", "LOAN_STATUS")
+
+    # Match your sheet logic (SOLD only) if the column exists in your BigQuery table
+    sold_clause = ""
+    if sold_only:
+        # Try common sold-status columns (edit if yours differs)
+        sold_clause = " AND UPPER(CAST(SOLD_UNSOLD_ID AS STRING)) = 'SOLD' "  # if column exists
+        # If your table doesn't have SOLD_UNSOLD_ID, comment above line and remove sold_only from schema.
+
+    where_filters = ""
+    if filters:
+        where_filters = " AND " + " AND ".join(filters)
+
+    sql = f"""
+      SELECT
+        COALESCE(CAST(CUSTOMER_NAME AS STRING), "") AS customer_name,
+        CAST(UNIT_NO AS STRING) AS unit_no,
+        SAFE_CAST(APPROVED_PRICE_INVENTORY_VALUE AS NUMERIC) AS approved_price,
+        SAFE_CAST(GROSS_SOLD_SALE_VALUE AS NUMERIC) AS gross_sold_sale_value,
+        (COALESCE(SAFE_CAST(GROSS_SOLD_SALE_VALUE AS NUMERIC),0) - COALESCE(SAFE_CAST(APPROVED_PRICE_INVENTORY_VALUE AS NUMERIC),0)) AS discount,
+        COALESCE(SAFE_CAST(GROSS_AMOUNT_RECEIVED AS NUMERIC), 0) AS gross_amount_received_till_date
+      FROM {table_fqn()}
+      WHERE DATE BETWEEN @from AND @to
+        {sold_clause}
+        {where_filters}
+      ORDER BY approved_price DESC
+      LIMIT {limit_n}
+    """
+
+    rows = []
+    job = bq.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=params))
+    for r in job.result():
+        d = dict(r)
+        for k in ("approved_price", "gross_sold_sale_value", "discount", "gross_amount_received_till_date"):
+            d[k] = float(d.get(k) or 0)
+        rows.append(d)
+
+    return jsonify({
+        "from": frm,
+        "to": to,
+        "count": len(rows),
+        "rows": rows,
+        "filters": {"sold_only": sold_only}
+    })
+
+
 # -----------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
