@@ -1,5 +1,4 @@
 import os
-from datetime import datetime
 from typing import Dict, List, Tuple, Optional
 
 from flask import Flask, jsonify, request
@@ -8,11 +7,13 @@ from google.cloud import bigquery
 app = Flask(__name__)
 bq = bigquery.Client()
 
-# ---- ENV ----
+# =========================
+# ENV
+# =========================
 BQ_PROJECT = os.getenv("BQ_PROJECT", "")
 BQ_DATASET = os.getenv("BQ_DATASET", "")
 
-# Use two tables (your dataset clearly has sales + payments)
+# Use two tables (as per your BigQuery dataset: sales + payments)
 BQ_SALES_TABLE = os.getenv("BQ_SALES_TABLE", "sales")
 BQ_PAYMENTS_TABLE = os.getenv("BQ_PAYMENTS_TABLE", "payments")
 
@@ -21,10 +22,12 @@ DATE_COL = os.getenv("DATE_COL", "DATE")
 
 API_KEY = os.getenv("API_KEY", "")
 
-# ---- AUTH ----
+# =========================
+# AUTH
+# =========================
 def require_bearer_auth():
     if not API_KEY:
-        return None
+        return None  # allow if no key configured
     auth = request.headers.get("Authorization", "")
     if auth.strip() != f"Bearer {API_KEY}":
         return jsonify({"error": "Unauthorized"}), 401
@@ -32,11 +35,14 @@ def require_bearer_auth():
 
 @app.before_request
 def auth_guard():
+    # Allow health/routes without auth
     if request.path in ("/health", "/routes"):
         return None
     return require_bearer_auth()
 
-# ---- HELPERS ----
+# =========================
+# HELPERS
+# =========================
 def table_fqn(table_name: str) -> str:
     if not (BQ_PROJECT and BQ_DATASET and table_name):
         raise ValueError("Missing BQ_PROJECT / BQ_DATASET / table name env vars")
@@ -47,7 +53,7 @@ def info_schema_fqn() -> str:
         raise ValueError("Missing BQ_PROJECT / BQ_DATASET env vars")
     return f"`{BQ_PROJECT}.{BQ_DATASET}.INFORMATION_SCHEMA.COLUMNS`"
 
-# Cache columns PER TABLE
+# Cache columns per table
 _COLUMNS_CACHE: Dict[str, set] = {}
 
 def get_columns(table_name: str) -> set:
@@ -73,9 +79,20 @@ def has_col(table_name: str, col: str) -> bool:
     return col.upper() in get_columns(table_name)
 
 def safe_num_expr(table_name: str, col: str) -> str:
+    """Returns SAFE_CAST(col AS NUMERIC) if column exists, else 0"""
     if not has_col(table_name, col):
         return "0"
     return f"SAFE_CAST({col} AS NUMERIC)"
+
+def safe_str_select(table_name: str, col: str, alias: str) -> Optional[str]:
+    if not has_col(table_name, col):
+        return None
+    return f"CAST({col} AS STRING) AS {alias}"
+
+def safe_num_select(table_name: str, col: str, alias: str) -> Optional[str]:
+    if not has_col(table_name, col):
+        return None
+    return f"SAFE_CAST({col} AS NUMERIC) AS {alias}"
 
 def get_date_range() -> Tuple[Optional[str], Optional[str], Optional[Tuple]]:
     frm = request.args.get("from")
@@ -114,7 +131,9 @@ def build_filters_where(table_name: str, params: Dict[str, str]):
         return " AND " + " AND ".join(where), qp, filters_echo
     return "", qp, filters_echo
 
-# ---- ROUTES ----
+# =========================
+# ROUTES
+# =========================
 @app.get("/health")
 def health():
     return jsonify({"status": "ok"})
@@ -124,7 +143,9 @@ def routes():
     return {"routes": sorted([f"{r.rule} [{','.join(sorted(r.methods - {'HEAD','OPTIONS'}))}]"
                               for r in app.url_map.iter_rules()])}
 
-# --- SOLDMIS SUMMARY (sales table) ---
+# =========================
+# /soldmis/summary (SALES TABLE)
+# =========================
 @app.get("/soldmis/summary")
 def soldmis_summary():
     frm, to, err = get_date_range()
@@ -140,7 +161,8 @@ def soldmis_summary():
 
     bookings_expr = "COUNT(1)"
     gross_sale_value_expr = f"SUM({safe_num_expr(table, 'GROSS_SOLD_SALE_VALUE')})"
-    # Sale value might be SALE_AGREEMENT or SALE_VALUE depending on your schema. Use SALE_AGREEMENT if present.
+
+    # sale_value: prefer SALE_AGREEMENT if present, else SALE_VALUE
     if has_col(table, "SALE_AGREEMENT"):
         sale_value_expr = f"SUM({safe_num_expr(table, 'SALE_AGREEMENT')})"
     else:
@@ -192,7 +214,9 @@ def soldmis_summary():
         }
     })
 
-# --- SOLDMIS BREAKDOWN (sales table) ---
+# =========================
+# /soldmis/breakdown (SALES TABLE)
+# =========================
 @app.get("/soldmis/breakdown")
 def soldmis_breakdown():
     frm, to, err = get_date_range()
@@ -257,7 +281,9 @@ def soldmis_breakdown():
 
     return jsonify({"from": frm, "to": to, "group_by": group_by, "rows": rows})
 
-# --- SOLDMIS UNIT (sales table) ---
+# =========================
+# /soldmis/unit (SALES TABLE)
+# =========================
 @app.get("/soldmis/unit")
 def soldmis_unit():
     unit_no = request.args.get("unit_no")
@@ -275,16 +301,21 @@ def soldmis_unit():
       WHERE UPPER(CAST(UNIT_NO AS STRING)) = UPPER(@unit_no)
       LIMIT 1
     """
-    job = bq.query(sql, job_config=bigquery.QueryJobConfig(
-        query_parameters=[bigquery.ScalarQueryParameter("unit_no", "STRING", unit_no)]
-    ))
+    job = bq.query(
+        sql,
+        job_config=bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("unit_no", "STRING", unit_no)]
+        ),
+    )
     r = next(iter(job.result()), None)
     if not r:
         return jsonify({"error": "Unit not found"}), 404
 
     return jsonify({"unit_no": unit_no, "record": dict(r)})
 
-# --- SOLDMIS PAYMENTS (payments table) ---
+# =========================
+# /soldmis/payments (PAYMENTS TABLE)
+# =========================
 @app.get("/soldmis/payments")
 def soldmis_payments():
     frm, to, err = get_date_range()
@@ -296,7 +327,6 @@ def soldmis_payments():
     if not has_col(table, DATE_COL):
         return jsonify({"error": f"Configured DATE_COL '{DATE_COL}' not found in table {table}"}), 500
 
-    # Schema says optional cluster filter; we’ll apply all optional filters if present & column exists
     extra_where, extra_qp, _filters_echo = build_filters_where(table, request.args)
 
     payment_cols = [f"PAYMENT_{i}" for i in range(1, 21)]
@@ -344,6 +374,111 @@ def soldmis_payments():
             "units_with_payments": int(row.get("units_with_payments") or 0),
         },
         "by_payment_index": by_payment_index
+    })
+
+# =========================
+# NEW: /soldmis/receivables (SALES TABLE)
+# =========================
+@app.get("/soldmis/receivables")
+def soldmis_receivables():
+    frm, to, err = get_date_range()
+    if err:
+        return err
+
+    table = BQ_SALES_TABLE
+
+    # Must have these to make a receivables list
+    required = ["UNIT_NO", "RECEIVABLES", DATE_COL]
+    missing = [c for c in required if not has_col(table, c)]
+    if missing:
+        return jsonify({"error": f"Missing required columns in {table}: {', '.join(missing)}"}), 500
+
+    # optional limit + min_receivable
+    limit = request.args.get("limit", "200")
+    try:
+        limit_n = max(1, min(int(limit), 1000))
+    except Exception:
+        return jsonify({"error": "limit must be an integer between 1 and 1000"}), 400
+
+    min_receivable = request.args.get("min_receivable", "1")
+    try:
+        min_recv = float(min_receivable)
+    except Exception:
+        return jsonify({"error": "min_receivable must be a number"}), 400
+
+    extra_where, extra_qp, filters_echo = build_filters_where(table, request.args)
+
+    # Include "all useful headers" if present in your table
+    select_parts = [
+        safe_str_select(table, "Cluster", "cluster"),
+        safe_str_select(table, "UNIT_NO", "unit_no"),
+        safe_str_select(table, "UNIT_TYPE", "unit_type"),
+        safe_num_select(table, "SALE_ABLE_AREA", "sale_able_area"),
+        safe_str_select(table, "CUSTOMER_NAME", "customer_name"),
+        safe_str_select(table, "MOBILE_NUMBER", "mobile_number"),
+        safe_str_select(table, "EMAIL_ID", "email_id"),
+        safe_str_select(table, "SOURCE", "source"),
+        safe_str_select(table, "SALE_AGREEMENT_STATUS", "sale_agreement_status"),
+        safe_str_select(table, "LOAN_STATUS", "loan_status"),
+        safe_num_select(table, "GROSS_SOLD_SALE_VALUE", "gross_sold_sale_value"),
+        safe_num_select(table, "SALE_AGREEMENT", "sale_agreement_value"),
+        safe_num_select(table, "CONSTRUCTION_AGREEMENT", "construction_agreement_value"),
+        safe_num_select(table, "GROSS_AMOUNT_RECEIVED", "gross_amount_received"),
+        safe_num_select(table, "PENDING_DEMAND", "pending_demand"),
+        safe_num_select(table, "RECEIVABLES", "receivables"),
+    ]
+    select_parts = [p for p in select_parts if p is not None]
+
+    # Keep output stable even if CUSTOMER_NAME missing
+    if not any("customer_name" in s for s in select_parts):
+        select_parts.append('"" AS customer_name')
+
+    sql = f"""
+      SELECT
+        {", ".join(select_parts)}
+      FROM {table_fqn(table)}
+      WHERE {DATE_COL} BETWEEN @from AND @to
+        AND SAFE_CAST(RECEIVABLES AS NUMERIC) >= @min_recv
+      {extra_where}
+      ORDER BY SAFE_CAST(RECEIVABLES AS NUMERIC) DESC
+      LIMIT {limit_n}
+    """
+
+    qp = [
+        bigquery.ScalarQueryParameter("from", "DATE", frm),
+        bigquery.ScalarQueryParameter("to", "DATE", to),
+        bigquery.ScalarQueryParameter("min_recv", "NUMERIC", min_recv),
+    ] + extra_qp
+
+    rows = []
+    total = 0.0
+    for r in bq.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=qp)).result():
+        d = dict(r)
+
+        # Normalize numbers to float
+        if "receivables" in d and d["receivables"] is not None:
+            d["receivables"] = float(d["receivables"])
+            total += d["receivables"]
+
+        for k in (
+            "gross_sold_sale_value",
+            "sale_agreement_value",
+            "construction_agreement_value",
+            "gross_amount_received",
+            "pending_demand",
+            "sale_able_area",
+        ):
+            if k in d and d[k] is not None:
+                d[k] = float(d[k])
+
+        rows.append(d)
+
+    return jsonify({
+        "from": frm,
+        "to": to,
+        "filters": filters_echo,
+        "total_receivables_in_list": total,
+        "rows": rows
     })
 
 if __name__ == "__main__":
