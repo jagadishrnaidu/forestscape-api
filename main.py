@@ -481,5 +481,183 @@ def soldmis_receivables():
         "rows": rows
     })
 
+# =========================
+# NEW: /soldmis/bookings (SALES + PAYMENTS TABLE)
+# Returns unit-level bookings list for a date range, even if receivables = 0
+# Includes customer, unit, booked values, discount, and payments received in the period
+# =========================
+@app.get("/soldmis/bookings")
+def soldmis_bookings():
+    frm, to, err = get_date_range()
+    if err:
+        return err
+
+    sales_table = BQ_SALES_TABLE
+    pay_table = BQ_PAYMENTS_TABLE
+
+    # Required minimum columns in SALES
+    required_sales = ["UNIT_NO", DATE_COL]
+    missing_sales = [c for c in required_sales if not has_col(sales_table, c)]
+    if missing_sales:
+        return jsonify({"error": f"Missing required columns in {sales_table}: {', '.join(missing_sales)}"}), 500
+
+    # Optional limit
+    limit = request.args.get("limit", "200")
+    try:
+        limit_n = max(1, min(int(limit), 1000))
+    except Exception:
+        return jsonify({"error": "limit must be an integer between 1 and 1000"}), 400
+
+    # Optional filters (cluster/source/unit_type/status/loan_status)
+    extra_where, extra_qp, filters_echo = build_filters_where(sales_table, request.args)
+
+    # ---- Build SALES select (include as many useful columns as exist) ----
+    sales_select_parts = [
+        safe_str_select(sales_table, "Cluster", "cluster"),
+        safe_str_select(sales_table, "UNIT_NO", "unit_no"),
+        safe_str_select(sales_table, "UNIT_TYPE", "unit_type"),
+        safe_str_select(sales_table, "CUSTOMER_NAME", "customer_name"),
+        safe_str_select(sales_table, "MOBILE_NUMBER", "mobile_number"),
+        safe_str_select(sales_table, "EMAIL_ID", "email_id"),
+        safe_str_select(sales_table, "SOURCE", "source"),
+        safe_str_select(sales_table, "SALE_AGREEMENT_STATUS", "sale_agreement_status"),
+        safe_str_select(sales_table, "LOAN_STATUS", "loan_status"),
+        safe_num_select(sales_table, "SALE_ABLE_AREA", "sale_able_area"),
+        safe_num_select(sales_table, "GROSS_SOLD_SALE_VALUE", "gross_sold_sale_value"),
+        # sale value: prefer SALE_AGREEMENT if present
+        safe_num_select(sales_table, "SALE_AGREEMENT", "sale_value"),
+        safe_num_select(sales_table, "SALE_VALUE", "sale_value_alt"),
+        safe_num_select(sales_table, "GROSS_AMOUNT_RECEIVED", "gross_amount_received_till_date"),
+        safe_num_select(sales_table, "RECEIVABLES", "receivables"),
+        safe_num_select(sales_table, "PENDING_DEMAND", "pending_demand"),
+    ]
+    sales_select_parts = [p for p in sales_select_parts if p is not None]
+
+    # Keep stable even if CUSTOMER_NAME missing
+    if not any("customer_name" in s for s in sales_select_parts):
+        sales_select_parts.append('"" AS customer_name')
+
+    # ---- Build PAYMENTS aggregation for the same date range (payments received in period) ----
+    # We sum PAYMENT_1..PAYMENT_20 if they exist in PAYMENTS table.
+    payment_cols = [f"PAYMENT_{i}" for i in range(1, 21)]
+    present_pay_cols = [c for c in payment_cols if has_col(pay_table, c)]
+
+    # If PAYMENTS table missing DATE or UNIT_NO, we will just return 0 payments_in_period
+    can_join_payments = has_col(pay_table, "UNIT_NO") and has_col(pay_table, DATE_COL) and len(present_pay_cols) > 0
+
+    if can_join_payments:
+        payments_sum_expr = " + ".join([f"COALESCE({safe_num_expr(pay_table, c)}, 0)" for c in present_pay_cols])
+        payments_cte = f"""
+          payments_agg AS (
+            SELECT
+              CAST(UNIT_NO AS STRING) AS unit_no,
+              SUM({payments_sum_expr}) AS payments_received_in_period
+            FROM {table_fqn(pay_table)}
+            WHERE {DATE_COL} BETWEEN @from AND @to
+            GROUP BY unit_no
+          )
+        """
+        join_clause = """
+          LEFT JOIN payments_agg p
+          ON UPPER(CAST(s.unit_no AS STRING)) = UPPER(CAST(p.unit_no AS STRING))
+        """
+        payments_select = "COALESCE(p.payments_received_in_period, 0) AS payments_received_in_period"
+    else:
+        payments_cte = "payments_agg AS (SELECT '' AS unit_no, 0 AS payments_received_in_period)"
+        join_clause = ""
+        payments_select = "0 AS payments_received_in_period"
+
+    # ---- SALES CTE ----
+    # Note: we alias UNIT_NO as unit_no in sales select
+    # Ensure we always have unit_no in selection
+    if not any(" AS unit_no" in s for s in sales_select_parts):
+        sales_select_parts.append("CAST(UNIT_NO AS STRING) AS unit_no")
+
+    sales_cte = f"""
+      sales_rows AS (
+        SELECT
+          {", ".join(sales_select_parts)}
+        FROM {table_fqn(sales_table)}
+        WHERE {DATE_COL} BETWEEN @from AND @to
+        {extra_where}
+      )
+    """
+
+    # ---- Main query ----
+    sql = f"""
+      WITH
+      {sales_cte},
+      {payments_cte}
+      SELECT
+        s.*,
+        {payments_select}
+      FROM sales_rows s
+      {join_clause}
+      ORDER BY SAFE_CAST(s.gross_sold_sale_value AS NUMERIC) DESC
+      LIMIT {limit_n}
+    """
+
+    qp = [
+        bigquery.ScalarQueryParameter("from", "DATE", frm),
+        bigquery.ScalarQueryParameter("to", "DATE", to),
+    ] + extra_qp
+
+    out_rows = []
+    for r in bq.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=qp)).result():
+        d = dict(r)
+
+        # Normalize numeric fields (if present)
+        for k in (
+            "sale_able_area",
+            "gross_sold_sale_value",
+            "sale_value",
+            "sale_value_alt",
+            "gross_amount_received_till_date",
+            "receivables",
+            "pending_demand",
+            "payments_received_in_period",
+        ):
+            if k in d and d[k] is not None:
+                try:
+                    d[k] = float(d[k])
+                except Exception:
+                    pass
+
+        # Choose sale_value from SALE_AGREEMENT if present, else SALE_VALUE
+        if "sale_value" not in d or d.get("sale_value") in (None, 0):
+            if "sale_value_alt" in d and d.get("sale_value_alt") not in (None, 0):
+                d["sale_value"] = d.get("sale_value_alt")
+
+        # Compute discount if we can
+        if d.get("gross_sold_sale_value") is not None and d.get("sale_value") is not None:
+            try:
+                d["discount"] = float(d["gross_sold_sale_value"]) - float(d["sale_value"])
+            except Exception:
+                d["discount"] = None
+        else:
+            d["discount"] = None
+
+        # Remove helper field
+        if "sale_value_alt" in d:
+            del d["sale_value_alt"]
+
+        out_rows.append(d)
+
+    return jsonify({
+        "from": frm,
+        "to": to,
+        "filters": filters_echo,
+        "count": len(out_rows),
+        "rows": out_rows,
+        "notes": {
+            "payments_received_in_period": (
+                "Computed from PAYMENTS table by summing PAYMENT_1..PAYMENT_20 for rows in the date range. "
+                "If PAYMENTS table lacks UNIT_NO/DATE/PAYMENT columns, this value will be 0."
+            ),
+            "discount": "Computed as gross_sold_sale_value - sale_value (if both present)."
+        }
+    })
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
